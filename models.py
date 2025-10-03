@@ -295,7 +295,6 @@ class TextEncoder(nn.Module):
                 actv,
                 nn.Dropout(0.2),
             ))
-        # self.cnn = nn.Sequential(*self.cnn)
 
         self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
 
@@ -311,20 +310,50 @@ class TextEncoder(nn.Module):
             
         x = x.transpose(1, 2)  # [B, T, chn]
 
-        input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(
-            x, input_lengths, batch_first=True, enforce_sorted=False)
+        # 确保 text_lengths 是正确的
+        text_lengths = input_lengths.clamp(min=1)  # 确保没有0长度
+        
+        # 调试信息：检查输入形状
+        batch_size, seq_len, features = x.shape
+        print(f"TextEncoder input - batch: {batch_size}, seq_len: {seq_len}, features: {features}")
+        print(f"text_lengths: {text_lengths}")
+        
+        # 创建 packed sequence - 修复形状问题
+        # 确保序列长度不超过实际序列长度
+        max_actual_length = x.size(1)
+        adjusted_lengths = torch.min(text_lengths, torch.tensor(max_actual_length, device=text_lengths.device))
+        
+        packed_embeddings = nn.utils.rnn.pack_padded_sequence(
+            x, 
+            adjusted_lengths.cpu(),  # 确保在CPU上
+            batch_first=True, 
+            enforce_sorted=False
+        )
 
         self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(
-            x, batch_first=True)
+        packed_output, _ = self.lstm(packed_embeddings)
+        
+        # 解包时使用正确的长度 - 修复形状不匹配问题
+        x, output_lengths = nn.utils.rnn.pad_packed_sequence(
+            packed_output,
+            batch_first=True,
+            padding_value=0.0,
+            total_length=None  # 让函数自动确定长度
+        )
+        
+        # 调试信息：检查输出形状
+        print(f"TextEncoder LSTM output - batch: {x.shape[0]}, seq_len: {x.shape[1]}, features: {x.shape[2]}")
+        print(f"output_lengths: {output_lengths}")
                 
         x = x.transpose(-1, -2)
-        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
-
-        x_pad[:, :, :x.shape[-1]] = x
-        x = x_pad.to(x.device)
+        
+        # 确保输出形状与掩码匹配
+        if x.size(-1) < m.size(-1):
+            x_pad = torch.zeros(x.size(0), x.size(1), m.size(-1), device=x.device)
+            x_pad[:, :, :x.size(-1)] = x
+            x = x_pad
+        elif x.size(-1) > m.size(-1):
+            x = x[:, :, :m.size(-1)]
         
         x.masked_fill_(m, 0.0)
         
@@ -333,7 +362,8 @@ class TextEncoder(nn.Module):
     def inference(self, x):
         x = self.embedding(x)
         x = x.transpose(1, 2)
-        x = self.cnn(x)
+        for c in self.cnn:
+            x = c(x)
         x = x.transpose(1, 2)
         self.lstm.flatten_parameters()
         x, _ = self.lstm(x)
@@ -343,7 +373,6 @@ class TextEncoder(nn.Module):
         mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
         mask = torch.gt(mask+1, lengths.unsqueeze(1))
         return mask
-
 
 
 class AdaIN1d(nn.Module):
@@ -601,7 +630,7 @@ def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG):
 
     def _load_model(model_config, model_path):
         model = ASRCNN(**model_config)
-        params = torch.load(model_path, map_location='cpu')['model']
+        params = torch.load(model_path, map_location='cpu', weights_only=False)['model']
         model.load_state_dict(params)
         return model
 
@@ -699,7 +728,25 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
     for key in model:
         if key in params and key not in ignore_modules:
             print('%s loaded' % key)
-            model[key].load_state_dict(params[key], strict=False)
+            try:
+                model[key].load_state_dict(params[key], strict=False)
+                print("success")
+            except RuntimeError as e:
+                print(f"Warning: Shape mismatch for {key}, skipping incompatible layers")
+                # 尝试部分加载
+                current_state = model[key].state_dict()
+                pretrained_state = params[key]
+    
+                # 只加载匹配的权重
+                for name, param in pretrained_state.items():
+                    if name in current_state:
+                        if current_state[name].shape == param.shape:
+                            current_state[name].copy_(param)
+                        else:
+                            print(f"Skipping {name} due to shape mismatch: {param.shape} vs {current_state[name].shape}")
+    
+                model[key].load_state_dict(current_state, strict=False)
+                
     _ = [model[key].eval() for key in model]
     
     if not load_only_params:
