@@ -50,6 +50,25 @@ handler = StreamHandler()
 handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
 
+def truncate_sequences(texts, input_lengths, text_mask, s2s_attn, s2s_attn_mono, max_seq_length=500):
+    """同时截断所有相关的序列张量"""
+    batch_size, seq_len = texts.shape
+    
+    if seq_len > max_seq_length:
+        print(f"Truncating sequences from {seq_len} to {max_seq_length}")
+        
+        # 截断文本相关张量
+        texts = texts[:, :max_seq_length]
+        text_mask = text_mask[:, :max_seq_length]
+        input_lengths = torch.clamp(input_lengths, max=max_seq_length)
+        
+        # 截断注意力张量
+        if s2s_attn is not None:
+            s2s_attn = s2s_attn[:, :max_seq_length, :]
+        if s2s_attn_mono is not None:
+            s2s_attn_mono = s2s_attn_mono[:, :max_seq_length, :]
+    
+    return texts, input_lengths, text_mask, s2s_attn, s2s_attn_mono
 
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
@@ -288,6 +307,11 @@ def main(config_path):
             mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
             s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
+            # 在编码之前截断所有相关序列
+            texts, input_lengths, text_mask, s2s_attn, s2s_attn_mono = truncate_sequences(
+                texts, input_lengths, text_mask, s2s_attn, s2s_attn_mono, max_seq_length=500
+            )
+
             # encode
             t_en = model.text_encoder(texts, input_lengths, text_mask)
             
@@ -315,7 +339,13 @@ def main(config_path):
             gs = torch.stack(gs).squeeze() # global acoustic styles
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
+            #bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
+            max_length = 512  # BERT 的最大序列长度
+            if texts.shape[1] > max_length:
+                texts = texts[:, :max_length]
+                text_mask = text_mask[:, :max_length]
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
+
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
             
             # denoiser training
@@ -351,11 +381,12 @@ def main(config_path):
             s_loss = 0
             
 
+          
             d, p = model.predictor(d_en, s_dur, 
                                                     input_lengths, 
                                                     s2s_attn_mono, 
                                                     text_mask)
-                
+           
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             en = []
@@ -464,7 +495,7 @@ def main(config_path):
             accelerator.backward(g_loss)
             if torch.isnan(g_loss):
                 from IPython.core.debugger import set_trace
-                set_trace()
+                #set_trace() Disabled Debug mode
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
@@ -594,6 +625,11 @@ def main(config_path):
 
                         mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
                         s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+
+                        # 在编码之前截断所有相关序列（验证集也需要）
+                        texts, input_lengths, text_mask, s2s_attn, s2s_attn_mono = truncate_sequences(
+                            texts, input_lengths, text_mask, s2s_attn, s2s_attn_mono, max_seq_length=500
+                        )
 
                         # encode
                         t_en = model.text_encoder(texts, input_lengths, text_mask)
